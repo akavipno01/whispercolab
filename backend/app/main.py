@@ -1,4 +1,5 @@
 import os
+import asyncio
 import tempfile
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -63,9 +64,10 @@ async def transcribe(file: UploadFile = File(...)):
         temp_file.write(content)
         
     try:
-        # Run whisper transcription
+        # Run whisper transcription in a threadpool to prevent blocking the event loop
         print(f"Transcribing {file.filename}...")
-        result = model.transcribe(temp_path)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: model.transcribe(temp_path))
         
         # Convert result segments to SRT format
         srt_content = ""
