@@ -45,6 +45,13 @@ Dùng `task_id` nhận được ở bước 1 để tra cứu (polling).
   }
   ```
 
+### 3. Tải File SRT Trực Tiếp (`GET /download/{task_id}`)
+Nếu bạn muốn tải trực tiếp file `.srt` (thay vì lấy nội dung JSON ở bước 2):
+```bash
+curl -O -J 'https://xyz.trycloudflare.com/download/YOUR_TASK_ID'
+```
+Lệnh trên sẽ tải file và lưu với tên `result_YOUR_TASK_ID.srt`. (Chỉ dùng được sau khi task đã "completed").
+
 ## Chạy thử cục bộ (Local)
 Nếu bạn có sẵn GPU và muốn chạy ở máy cá nhân:
 ```bash
