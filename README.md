@@ -17,16 +17,33 @@ Dự án được tạo ra nhằm cung cấp giải pháp xử lý giọng nói 
 5. Sau khi hoàn tất, ở Cell cuối cùng sẽ in ra một liên kết (URL) của Cloudflare (VD: `https://xyz.trycloudflare.com`).
 6. Dùng URL đó làm Base URL cho API của bạn.
 
-## API Endpoints
+## API Endpoints (Bất đồng bộ)
 
-### `POST /transcribe`
-Chuyển đổi file âm thanh thành phụ đề.
+Hệ thống sử dụng cơ chế xử lý nền (Background Tasks) kết hợp `faster-whisper` để xử lý mượt mà các file âm thanh dài mà không bị dính lỗi Timeout 524 của Cloudflare.
 
+### 1. Gửi File Âm Thanh (`POST /transcribe`)
 - **Request Body (Multipart/form-data):**
   - `file`: File âm thanh (.mp3, .wav...)
-
 - **Response:**
-  Trạng thái HTTP 200 kèm nội dung file `.srt`.
+  Trả về ngay lập tức mã `task_id`. 
+  ```json
+  {
+    "task_id": "12345abcde",
+    "message": "Transcription task queued..."
+  }
+  ```
+
+### 2. Lấy Kết Quả SRT (`GET /status/{task_id}`)
+Dùng `task_id` nhận được ở bước 1 để tra cứu (polling).
+- **Response:**
+  ```json
+  {
+    "status": "completed", // có thể là "queued", "processing", "completed", "error"
+    "srt": "1\n00:00:00,000 --> 00:00:05,000\nNội dung phụ đề...",
+    "language": "vi",
+    "error": null
+  }
+  ```
 
 ## Chạy thử cục bộ (Local)
 Nếu bạn có sẵn GPU và muốn chạy ở máy cá nhân:

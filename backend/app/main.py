@@ -1,37 +1,46 @@
 import os
 import asyncio
 import tempfile
+import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated
 from pathlib import Path
 import datetime
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import whisper
+from faster_whisper import WhisperModel
 
-# Global variable to store the loaded model
+# Global variables
 model = None
 MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
+
+# Simple in-memory task store
+tasks = {}
 
 def format_timestamp(seconds: float) -> str:
     """Convert seconds to SRT timestamp format (HH:MM:SS,mmm)"""
     td = datetime.timedelta(seconds=seconds)
-    # td might not have hours if it's short, so we format it carefully
     hours, remainder = divmod(td.seconds, 3600)
     minutes, seconds_int = divmod(remainder, 60)
     milliseconds = int(td.microseconds / 1000)
     return f"{hours:02d}:{minutes:02d}:{seconds_int:02d},{milliseconds:03d}"
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model
-    print(f"Loading Whisper model '{MODEL_SIZE}'...")
-    # Load model on startup
-    model = whisper.load_model(MODEL_SIZE)
-    print("Model loaded successfully!")
+    print(f"Loading faster-whisper model '{MODEL_SIZE}'...")
+    # Load faster-whisper model on startup
+    # Use CPU by default if testing locally without GPU, otherwise it will fail.
+    # In colab we have cuda. We'll wrap in try-except to fallback to cpu if needed.
+    try:
+        model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+        print("Model loaded successfully on CUDA!")
+    except Exception as e:
+        print(f"Failed to load on CUDA: {e}. Falling back to CPU...")
+        model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+        print("Model loaded successfully on CPU!")
     yield
     print("Shutting down...")
 
@@ -46,48 +55,86 @@ app.add_middleware(
 )
 
 class TranscribeResponse(BaseModel):
-    srt: str
-    language: str
+    task_id: str
+    message: str
 
-@app.post("/transcribe", response_model=TranscribeResponse)
-async def transcribe(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-    
-    # Check extension if needed, though whisper handles most audio formats via ffmpeg
-    ext = Path(file.filename).suffix.lower()
-    
-    # Save the uploaded file to a temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
-        temp_path = temp_file.name
-        content = await file.read()
-        temp_file.write(content)
-        
+class TaskStatusResponse(BaseModel):
+    status: str
+    srt: str | None = None
+    language: str | None = None
+    error: str | None = None
+
+def process_transcription(task_id: str, temp_path: str, filename: str):
     try:
-        # Run whisper transcription in a threadpool to prevent blocking the event loop
-        print(f"Transcribing {file.filename}...")
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, lambda: model.transcribe(temp_path))
+        tasks[task_id]["status"] = "processing"
+        print(f"Task {task_id}: Transcribing {filename}...")
         
-        # Convert result segments to SRT format
+        segments, info = model.transcribe(temp_path, beam_size=5)
+        
         srt_content = ""
-        for i, segment in enumerate(result["segments"], start=1):
-            start_time = format_timestamp(segment["start"])
-            end_time = format_timestamp(segment["end"])
-            text = segment["text"].strip()
+        for i, segment in enumerate(segments, start=1):
+            start_time = format_timestamp(segment.start)
+            end_time = format_timestamp(segment.end)
+            text = segment.text.strip()
             
             srt_content += f"{i}\n"
             srt_content += f"{start_time} --> {end_time}\n"
             srt_content += f"{text}\n\n"
             
-        return TranscribeResponse(srt=srt_content, language=result.get("language", "unknown"))
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["srt"] = srt_content
+        tasks[task_id]["language"] = info.language
+        print(f"Task {task_id}: Completed.")
+        
     except Exception as e:
-        print(f"Error during transcription: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Task {task_id}: Error - {e}")
+        tasks[task_id]["status"] = "error"
+        tasks[task_id]["error"] = str(e)
     finally:
-        # Clean up temporary file
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+@app.post("/transcribe", response_model=TranscribeResponse)
+async def transcribe(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    
+    ext = Path(file.filename).suffix.lower()
+    
+    # Save the uploaded file to a temporary file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    temp_path = temp_file.name
+    content = await file.read()
+    temp_file.write(content)
+    temp_file.close()
+    
+    task_id = uuid.uuid4().hex
+    tasks[task_id] = {
+        "status": "queued",
+        "srt": None,
+        "language": None,
+        "error": None
+    }
+    
+    # Run the processing in the background
+    background_tasks.add_task(process_transcription, task_id, temp_path, file.filename)
+    
+    return TranscribeResponse(
+        task_id=task_id, 
+        message="Transcription task queued. Check status using /status/{task_id}"
+    )
+
+@app.get("/status/{task_id}", response_model=TaskStatusResponse)
+def get_status(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return TaskStatusResponse(
+        status=tasks[task_id]["status"],
+        srt=tasks[task_id]["srt"],
+        language=tasks[task_id]["language"],
+        error=tasks[task_id]["error"]
+    )
 
 @app.get("/health")
 def health_check():
